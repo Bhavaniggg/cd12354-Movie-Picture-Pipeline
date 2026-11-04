@@ -1,10 +1,13 @@
 
-name: Movie Picture Continuous Deployment
+name: Frontend Continuous Deployment
 
 on:
   push:
     branches:
       - main
+    paths:
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-cd.yaml'
   workflow_dispatch:
 
 permissions:
@@ -12,13 +15,12 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ECR_BACKEND: mp-backend
-  ECR_FRONTEND: mp-frontend
+  ECR_REPOSITORY: mp-frontend
   EKS_CLUSTER: cluster
 
 jobs:
   deploy:
-    name: Build, Push and Deploy
+    name: Build, Push and Deploy Frontend
     runs-on: ubuntu-latest
 
     steps:
@@ -36,38 +38,13 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push backend image
-        env:
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build \
-            -t $ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG \
-            ./starter/backend
-
-          docker push $ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG
-
-      - name: Configure kubectl
+      - name: Get backend LoadBalancer URL
+        id: backend-url
         run: |
           aws eks update-kubeconfig \
             --region $AWS_REGION \
             --name $EKS_CLUSTER
 
-      - name: Deploy backend to EKS
-        env:
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          kubectl apply -k starter/backend/k8s
-
-          kubectl set image deployment/backend \
-            backend=$ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG
-
-          kubectl rollout status deployment/backend --timeout=300s
-
-      - name: Get backend LoadBalancer URL
-        id: backend-url
-        run: |
           echo "Waiting for backend LoadBalancer..."
 
           for i in {1..60}; do
@@ -90,10 +67,10 @@ jobs:
             sleep 10
           done
 
-          echo "Backend LoadBalancer was not ready in time."
+          echo "Backend LoadBalancer was not ready."
           exit 1
 
-      - name: Build and push frontend image
+      - name: Build frontend Docker image
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -101,10 +78,15 @@ jobs:
         run: |
           docker build \
             --build-arg REACT_APP_MOVIE_API_URL=$BACKEND_API_URL \
-            -t $ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             ./starter/frontend
 
-          docker push $ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG
+      - name: Push frontend image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
       - name: Deploy frontend to EKS
         env:
@@ -114,17 +96,13 @@ jobs:
           kubectl apply -k starter/frontend/k8s
 
           kubectl set image deployment/frontend \
-            frontend=$ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG
+            frontend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
           kubectl rollout status deployment/frontend --timeout=300s
 
-      - name: Show deployment status
+      - name: Verify frontend deployment
         run: |
-          echo "Deployments:"
-          kubectl get deployments
-
-          echo "Pods:"
+          kubectl get deployment frontend
           kubectl get pods
+          kubectl get service frontend
 
-          echo "Services:"
-          kubectl get services

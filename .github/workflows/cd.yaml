@@ -1,0 +1,130 @@
+
+name: Movie Picture Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND: mp-backend
+  ECR_FRONTEND: mp-frontend
+  EKS_CLUSTER: cluster
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG \
+            ./starter/backend
+
+          docker push $ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region $AWS_REGION \
+            --name $EKS_CLUSTER
+
+      - name: Deploy backend to EKS
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          kubectl apply -k starter/backend/k8s
+
+          kubectl set image deployment/backend \
+            backend=$ECR_REGISTRY/$ECR_BACKEND:$IMAGE_TAG
+
+          kubectl rollout status deployment/backend --timeout=300s
+
+      - name: Get backend LoadBalancer URL
+        id: backend-url
+        run: |
+          echo "Waiting for backend LoadBalancer..."
+
+          for i in {1..60}; do
+            HOST=$(kubectl get svc backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            IP=$(kubectl get svc backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$HOST" ]; then
+              echo "url=http://$HOST" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            if [ -n "$IP" ]; then
+              echo "url=http://$IP" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Backend LoadBalancer was not ready in time."
+          exit 1
+
+      - name: Build and push frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          BACKEND_API_URL: ${{ steps.backend-url.outputs.url }}
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL=$BACKEND_API_URL \
+            -t $ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG \
+            ./starter/frontend
+
+          docker push $ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG
+
+      - name: Deploy frontend to EKS
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          kubectl apply -k starter/frontend/k8s
+
+          kubectl set image deployment/frontend \
+            frontend=$ECR_REGISTRY/$ECR_FRONTEND:$IMAGE_TAG
+
+          kubectl rollout status deployment/frontend --timeout=300s
+
+      - name: Show deployment status
+        run: |
+          echo "Deployments:"
+          kubectl get deployments
+
+          echo "Pods:"
+          kubectl get pods
+
+          echo "Services:"
+          kubectl get services

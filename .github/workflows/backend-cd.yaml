@@ -5,76 +5,88 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'starter/backend/**'
-      - '.github/workflows/backend-cd.yaml'
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: mp-backend
-  EKS_CLUSTER: cluster
 
 jobs:
   lint:
     name: Backend Lint
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: starter/backend
-
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: backend-pip-${{ runner.os }}-${{ hashFiles('starter/backend/Pipfile.lock') }}
 
       - name: Install Pipenv
         run: pip install pipenv
 
       - name: Install dependencies
-        run: pipenv install --dev
+        working-directory: starter/backend
+        run: pipenv install --dev --deploy
 
       - name: Run lint
+        working-directory: starter/backend
         run: pipenv run lint
 
   test:
-    name: Backend Tests
+    name: Backend Test
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: starter/backend
-
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: backend-pip-${{ runner.os }}-${{ hashFiles('starter/backend/Pipfile.lock') }}
 
       - name: Install Pipenv
         run: pip install pipenv
 
       - name: Install dependencies
-        run: pipenv install
+        working-directory: starter/backend
+        run: pipenv install --dev --deploy
 
       - name: Run tests
+        working-directory: starter/backend
         run: pipenv run test
 
-  deploy:
-    name: Build, Push and Deploy Backend
+  build:
+    name: Backend Docker Build
+    needs:
+      - lint
+      - test
     runs-on: ubuntu-latest
-    needs: [lint, test]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        working-directory: starter/backend
+        run: docker build -t movie-picture-backend:${{ github.sha }} .
+
+  deploy:
+    name: Deploy Backend to EKS
+    needs: build
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -85,48 +97,94 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
       - name: Login to Amazon ECR
-        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build backend Docker image
+      - name: Build and push backend image
+        working-directory: starter/backend
         env:
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.BACKEND_ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            ./starter/backend
+          docker build -t "$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REPOSITORY:$IMAGE_TAG"
 
-      - name: Push backend image to ECR
-        env:
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-      - name: Configure kubectl
+      - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig \
-            --region $AWS_REGION \
-            --name $EKS_CLUSTER
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ secrets.EKS_CLUSTER_NAME }}"
+
+      - name: Verify EKS access
+        run: kubectl get nodes
 
       - name: Deploy backend to EKS
+        working-directory: starter/backend/k8s
         env:
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.BACKEND_ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          kubectl apply -k starter/backend/k8s
+          sed -i "s|image: backend|image: $ECR_REPOSITORY:$IMAGE_TAG|" deployment.yaml
+          kubectl kustomize . | kubectl apply -f -
 
-          kubectl set image deployment/backend \
-            backend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-          kubectl rollout status deployment/backend --timeout=300s
-
-      - name: Verify backend deployment
+      - name: Wait for backend rollout
         run: |
-          kubectl get deployment backend
+          kubectl rollout status deployment/backend --timeout=180s
+
+      - name: Verify backend pods
+        run: |
           kubectl get pods
           kubectl get service backend
+
+      - name: Verify backend API
+        run: |
+          echo "Waiting for backend LoadBalancer..."
+
+          for i in {1..30}; do
+            BACKEND_HOST=$(kubectl get service backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            if [ -n "$BACKEND_HOST" ]; then
+              echo "Backend URL: http://$BACKEND_HOST"
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "$BACKEND_HOST" ]; then
+            echo "Backend LoadBalancer hostname was not assigned."
+            exit 1
+          fi
+
+          echo "Testing /movies..."
+
+          curl --fail --retry 10 --retry-delay 5 \
+            "http://$BACKEND_HOST/movies" \
+            -o backend-response.json
+
+          cat backend-response.json
+
+          python - <<'PY'
+          import json
+
+          with open("backend-response.json") as f:
+              data = json.load(f)
+
+          movies = data.get("movies")
+
+          if not isinstance(movies, list) or len(movies) == 0:
+              raise SystemExit(
+                  "Backend /movies did not return a non-empty movies list."
+              )
+
+          print(
+              f"Backend verification passed: {len(movies)} movies returned."
+          )
+          PY
